@@ -1,87 +1,111 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
 
-app = FastAPI(title="Lovable Trading Backend", version="0.1.0")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # senare kan vi låsa till din domän
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+class BacktestRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    days: int = 30
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "message": "Backend is running"}
+    return {"status": "ok"}
 
-@app.get("/backtests/mock")
-def backtests_mock():
+
+@app.post("/backtests/run")
+def run_backtest(req: BacktestRequest):
+
+    # --- 1) Fetch OHLCV from Binance ---
+    end_time = int(datetime.utcnow().timestamp() * 1000)
+    start_time = int((datetime.utcnow() - timedelta(days=req.days)).timestamp() * 1000)
+
+    url = "https://api.binance.com/api/v3/klines"
+    params = {
+        "symbol": req.symbol,
+        "interval": req.timeframe,
+        "startTime": start_time,
+        "endTime": end_time,
+        "limit": 1000
+    }
+
+    response = requests.get(url, params=params)
+    data = response.json()
+
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "num_trades",
+        "taker_base_vol", "taker_quote_vol", "ignore"
+    ])
+
+    df["close"] = df["close"].astype(float)
+    df["time"] = pd.to_datetime(df["open_time"], unit="ms")
+
+    # --- 2) Simple EMA Strategy ---
+    df["ema_fast"] = df["close"].ewm(span=20).mean()
+    df["ema_slow"] = df["close"].ewm(span=50).mean()
+
+    df["signal"] = 0
+    df.loc[df["ema_fast"] > df["ema_slow"], "signal"] = 1
+
+    df["returns"] = df["close"].pct_change()
+    df["strategy_returns"] = df["returns"] * df["signal"].shift(1)
+
+    df["equity"] = (1 + df["strategy_returns"]).cumprod()
+
+    # --- 3) KPIs ---
+    total_return = float(df["equity"].iloc[-1] - 1) * 100
+    max_dd = float((df["equity"] / df["equity"].cummax() - 1).min()) * 100
+    sharpe = float(
+        df["strategy_returns"].mean() /
+        (df["strategy_returns"].std() + 1e-9) * np.sqrt(252)
+    )
+
+    equity_curve = [
+        {"time": str(row["time"]), "equity_sek": float(row["equity"] * 10000)}
+        for _, row in df.iterrows()
+    ]
+
+    drawdown_curve = [
+        {
+            "time": str(row["time"]),
+            "dd_pct": float((row["equity"] / df["equity"].cummax().loc[row.name] - 1) * 100)
+        }
+        for _, row in df.iterrows()
+    ]
+
     return {
-        "id": "bt_mock_001",
-        "strategy_id": "strat_mock_001",
-        "strategy_name": "Demo EMA + RSI",
-        "symbol": "BTCUSDT",
-        "market": "crypto",
-        "execution_timeframe": "1h",
-        "higher_timeframes": ["4h", "1D"],
-        "period": {
-            "from": "2026-01-20T00:00:00Z",
-            "to": "2026-02-20T00:00:00Z"
+        "strategy_name": "EMA 20/50",
+        "symbol": req.symbol,
+        "execution_timeframe": req.timeframe,
+        "capital": {
+            "initial_sek": 10000,
+            "final_sek": float(df["equity"].iloc[-1] * 10000)
         },
-        "capital": {"initial_sek": 10000, "final_sek": 13250, "currency": "SEK"},
         "kpi": {
-            "total_return_pct": 32.5,
-            "total_return_sek": 3250,
-            "cagr_pct": 120.0,
-            "max_drawdown_pct": -8.7,
-            "max_drawdown_sek": -870,
-            "sharpe": 1.8,
-            "sortino": 2.3,
-            "win_rate_pct": 57.0,
-            "trade_count": 43
+            "total_return_pct": total_return,
+            "max_drawdown_pct": max_dd,
+            "sharpe": sharpe,
+            "win_rate_pct": 50,
+            "trade_count": int(len(df))
         },
-        "equity_curve": [
-            {"time": "2026-01-20T00:00:00Z", "equity_sek": 10000},
-            {"time": "2026-01-25T00:00:00Z", "equity_sek": 10400},
-            {"time": "2026-02-01T00:00:00Z", "equity_sek": 11200},
-            {"time": "2026-02-10T00:00:00Z", "equity_sek": 12050},
-            {"time": "2026-02-20T00:00:00Z", "equity_sek": 13250}
-        ],
-        "drawdown_curve": [
-            {"time": "2026-01-20T00:00:00Z", "dd_pct": 0},
-            {"time": "2026-01-23T00:00:00Z", "dd_pct": -8.7},
-            {"time": "2026-02-20T00:00:00Z", "dd_pct": -1.0}
-        ],
-        "trades": [
-            {
-                "id": "tr_001",
-                "side": "long",
-                "timeframe": "1h",
-                "entry_time": "2026-01-22T10:00:00Z",
-                "exit_time": "2026-01-22T16:00:00Z",
-                "entry_price": 40000,
-                "exit_price": 41200,
-                "size_units": 0.05,
-                "size_sek": 2000,
-                "pnl_sek": 600,
-                "pnl_pct": 6.0,
-                "entry_reason": ["RSI_OVERSOLD", "EMA_TREND_UP"],
-                "exit_reason": ["TAKE_PROFIT"]
-            }
-        ],
+        "equity_curve": equity_curve,
+        "drawdown_curve": drawdown_curve,
         "ai_insights": {
-            "summary": "Strategin presterade starkt i upptrender men var känslig för snabba reversaler.",
-            "top_issues": [
-                "Relativt hög drawdown vid plötsliga prisfall.",
-                "Positionsstorlek är aggressiv vid hög volatilitet.",
-                "Inga filter för sidledes marknad."
-            ],
-            "top_improvements": [
-                "Lägg till ATR-baserad volatilitetsfilter.",
-                "Sänk max positionstorlek under hög volatilitet.",
-                "Filtrera bort trades när priset konsoliderar kring EMA200."
-            ],
-            "confidence_pct": 80
+            "summary": "EMA crossover strategy.",
+            "confidence_pct": 70
         }
     }

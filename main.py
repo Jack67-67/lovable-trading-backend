@@ -26,7 +26,28 @@ class BacktestRequest(BaseModel):
     days: int = 30
 
 @app.get("/health")
-def health():
+@app.get("/backtests/mock")
+def backtests_mock():
+    return {
+        "strategy_name": "Mock Strategy",
+        "symbol": "BTCUSDT",
+        "execution_timeframe": "1h",
+        "capital": {"initial_sek": 10000, "final_sek": 12000},
+        "kpi": {
+            "total_return_pct": 20,
+            "max_drawdown_pct": -5,
+            "sharpe": 1.5,
+            "win_rate_pct": 55,
+            "trade_count": 50
+        },
+        "equity_curve": [],
+        "drawdown_curve": [],
+        "ai_insights": {
+            "summary": "Mock data.",
+            "confidence_pct": 60
+        }
+    }
+    def health():
     return {"status": "ok"}
 
 @app.post("/backtests/run")

@@ -67,11 +67,27 @@ def run_backtest(req: BacktestRequest):
             "limit": 1000
         }
 
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
+       response = requests.get(
+    url,
+    params=params,
+    timeout=10,
+    headers={"User-Agent": "lovable-trading/1.0"},
+)
 
-        if not isinstance(data, list) or len(data) == 0:
-            raise HTTPException(status_code=400, detail="No market data returned")
+# Om Binance svarar med felstatus, ge tillbaka texten
+if response.status_code != 200:
+    raise HTTPException(status_code=502, detail=f"Binance HTTP {response.status_code}: {response.text}")
+
+data = response.json()
+
+# Binance fel kommer ofta som dict: {"code": ..., "msg": "..."}
+if isinstance(data, dict):
+    msg = data.get("msg") or str(data)
+    raise HTTPException(status_code=400, detail=f"Binance error: {msg}")
+
+# Tom lista = inga candles
+if not isinstance(data, list) or len(data) == 0:
+    raise HTTPException(status_code=400, detail="No OHLCV candles returned (check symbol/timeframe)")
 
         df = pd.DataFrame(data, columns=[
             "open_time", "open", "high", "low", "close", "volume",

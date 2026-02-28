@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import os
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 
 app = FastAPI()
 
@@ -16,24 +16,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
+TD_BASE = "https://api.twelvedata.com"
+
+# Twelve Data interval examples: "1min","5min","15min","30min","1h","4h","1day","1week","1month"
+ALLOWED_INTERVALS = {
+    "1min","5min","15min","30min",
+    "1h","2h","4h","8h","12h",
+    "1day","1week","1month"
+}
 
 class BacktestRequest(BaseModel):
-    symbol: str
-    timeframe: str
-    days: int = 30
-
+    market: str              # "crypto" | "forex" | "stocks" | "indices"
+    symbol: str              # ex: "BTC/USD" (crypto) or "EUR/USD" (forex) or "AAPL" (stocks) or "SPX" (indices) depending on provider
+    interval: str            # ex: "1h", "4h", "1day"
+    outputsize: int = 500    # number of candles (keep <= provider limits)
+    exchange: str | None = None  # optional, e.g. "NASDAQ" for stocks, or crypto exchange if needed
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "provider": "twelvedata", "has_api_key": bool(TD_API_KEY)}
 
 @app.get("/backtests/mock")
 def backtests_mock():
     return {
         "strategy_name": "Mock Strategy",
-        "symbol": "BTCUSDT",
+        "symbol": "BTC/USD",
         "execution_timeframe": "1h",
         "capital": {"initial_sek": 10000, "final_sek": 12000},
         "kpi": {
@@ -55,103 +63,98 @@ def backtests_mock():
             {"time": "2026-01-03T00:00:00", "dd_pct": -0.69},
             {"time": "2026-01-04T00:00:00", "dd_pct": 0},
         ],
-        "ai_insights": {
-            "summary": "Mock data.",
-            "confidence_pct": 60
-        }
+        "ai_insights": {"summary": "Mock data.", "confidence_pct": 60}
     }
 
+def td_time_series(market: str, symbol: str, interval: str, outputsize: int, exchange: str | None):
+    if not TD_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY in Railway variables")
 
-def fetch_binance_klines(symbol: str, interval: str, days: int) -> pd.DataFrame:
-    # Binance limit=1000 candles per request. For 1h and 30 days, 720 candles -> OK.
-    end_time_ms = int(datetime.utcnow().timestamp() * 1000)
-    start_time_ms = int((datetime.utcnow() - timedelta(days=days)).timestamp() * 1000)
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(status_code=400, detail=f"Invalid interval. Allowed: {sorted(ALLOWED_INTERVALS)}")
 
+    # Twelve Data uses different endpoints per asset class
+    # - Stocks/indices/forex/crypto can be served via /time_series with appropriate symbol formatting
+    # Often:
+    #  crypto: "BTC/USD" (and optionally exchange like "Coinbase")
+    #  forex: "EUR/USD"
+    #  stocks: "AAPL" + exchange "NASDAQ"
+    #  indices: varies by provider. Common: "SPX", "DJI", etc (may require exchange)
+    url = f"{TD_BASE}/time_series"
     params = {
+        "apikey": TD_API_KEY,
         "symbol": symbol,
         "interval": interval,
-        "startTime": start_time_ms,
-        "endTime": end_time_ms,
-        "limit": 1000
+        "outputsize": int(max(50, min(outputsize, 5000))),  # clamp
+        "format": "JSON",
+        "timezone": "UTC"
     }
+    if exchange:
+        params["exchange"] = exchange
 
-    r = requests.get(
-        BINANCE_KLINES_URL,
-        params=params,
-        timeout=12,
-        headers={"User-Agent": "lovable-trading/1.0"},
-    )
-
+    r = requests.get(url, params=params, timeout=15)
     if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Binance HTTP {r.status_code}: {r.text}")
+        raise HTTPException(status_code=502, detail=f"TwelveData HTTP {r.status_code}: {r.text}")
 
     data = r.json()
 
-    # Binance errors come as dict like {"code":-1121,"msg":"Invalid symbol."}
-    if isinstance(data, dict):
-        msg = data.get("msg") or str(data)
-        raise HTTPException(status_code=400, detail=f"Binance error: {msg}")
+    # Twelve Data errors typically look like: {"status":"error","message":"...","code":...}
+    if isinstance(data, dict) and data.get("status") == "error":
+        raise HTTPException(status_code=400, detail=f"TwelveData error: {data.get('message')}")
 
-    if not isinstance(data, list) or len(data) == 0:
-        raise HTTPException(status_code=400, detail="No OHLCV candles returned (check symbol/timeframe/days)")
+    values = data.get("values")
+    if not values or not isinstance(values, list):
+        raise HTTPException(status_code=400, detail=f"No OHLCV returned for {symbol} {interval}")
 
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "num_trades",
-        "taker_base_vol", "taker_quote_vol", "ignore"
-    ])
+    # values are newest-first; make ascending time
+    df = pd.DataFrame(values)
+    # Normalize columns
+    # expected: datetime, open, high, low, close, volume (volume may be missing for some assets)
+    if "datetime" not in df.columns or "close" not in df.columns:
+        raise HTTPException(status_code=400, detail="Provider response missing datetime/close")
 
-    # Convert types safely
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["time"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(None)
+    for col in ["open","high","low","close"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert(None)
+    if "volume" in df.columns:
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
-    df = df.dropna(subset=["close"]).sort_values("time").reset_index(drop=True)
-
-    if df.empty or len(df) < 10:
-        raise HTTPException(status_code=400, detail="Not enough OHLCV data to run backtest")
+    df = df.sort_values("time").reset_index(drop=True)
+    df = df.dropna(subset=["close"])
+    if df.empty or len(df) < 20:
+        raise HTTPException(status_code=400, detail="Not enough data to backtest (try higher outputsize)")
 
     return df
 
-
 @app.post("/backtests/run")
 def run_backtest(req: BacktestRequest):
-    """
-    Simple EMA 20/50 crossover backtest on Binance OHLCV.
-    Returns format expected by frontend (kpi + curves).
-    """
-    symbol = (req.symbol or "").upper().strip()
-    interval = (req.timeframe or "").strip()
+    market = (req.market or "").lower().strip()
+    symbol = (req.symbol or "").strip()
+    interval = (req.interval or "").strip()
+    exchange = (req.exchange or "").strip() if req.exchange else None
 
+    if market not in {"crypto","forex","stocks","indices"}:
+        raise HTTPException(status_code=400, detail="market must be one of: crypto, forex, stocks, indices")
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
-    if not interval:
-        raise HTTPException(status_code=400, detail="timeframe is required")
-    if req.days < 1 or req.days > 365:
-        raise HTTPException(status_code=400, detail="days must be between 1 and 365")
 
-    df = fetch_binance_klines(symbol, interval, req.days)
+    df = td_time_series(market, symbol, interval, req.outputsize, exchange)
 
-    # Strategy params (hard-coded for v1)
-    ema_fast = 20
-    ema_slow = 50
-
+    # --- Strategy v1: EMA 20/50 crossover on close ---
+    ema_fast, ema_slow = 20, 50
     df["ema_fast"] = df["close"].ewm(span=ema_fast, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=ema_slow, adjust=False).mean()
-
     df["signal"] = (df["ema_fast"] > df["ema_slow"]).astype(int)
 
     df["returns"] = df["close"].pct_change().fillna(0.0)
     df["strategy_returns"] = (df["returns"] * df["signal"].shift(1).fillna(0)).replace([np.inf, -np.inf], 0).fillna(0)
-
     df["equity"] = (1.0 + df["strategy_returns"]).cumprod()
-    df["equity"] = df["equity"].replace([np.inf, -np.inf], np.nan).fillna(method="ffill").fillna(1.0)
 
     running_max = df["equity"].cummax()
     drawdown = df["equity"] / running_max - 1.0
 
-    # KPI
     initial_sek = 10000.0
     final_sek = float(df["equity"].iloc[-1] * initial_sek)
 
@@ -161,10 +164,8 @@ def run_backtest(req: BacktestRequest):
     std = float(df["strategy_returns"].std())
     sharpe = float(df["strategy_returns"].mean() / (std + 1e-9) * np.sqrt(252))
 
-    # naive trade count: count signal changes
     trade_count = int((df["signal"].diff().fillna(0) != 0).sum())
 
-    # Curves for charts
     equity_curve = [{"time": str(t), "equity_sek": float(e * initial_sek)} for t, e in zip(df["time"], df["equity"])]
     drawdown_curve = [{"time": str(t), "dd_pct": float(d * 100.0)} for t, d in zip(df["time"], drawdown)]
 
@@ -172,10 +173,7 @@ def run_backtest(req: BacktestRequest):
         "strategy_name": f"EMA {ema_fast}/{ema_slow}",
         "symbol": symbol,
         "execution_timeframe": interval,
-        "capital": {
-            "initial_sek": int(initial_sek),
-            "final_sek": final_sek
-        },
+        "capital": {"initial_sek": int(initial_sek), "final_sek": final_sek},
         "kpi": {
             "total_return_pct": total_return_pct,
             "max_drawdown_pct": max_drawdown_pct,
@@ -186,7 +184,7 @@ def run_backtest(req: BacktestRequest):
         "equity_curve": equity_curve,
         "drawdown_curve": drawdown_curve,
         "ai_insights": {
-            "summary": "EMA crossover baseline. Next: add RSI/ATR risk, and multi-timeframe confirmation.",
+            "summary": "Baseline EMA crossover. Next: RSI/ATR + multi-timeframe confirmation + realistic fees/slippage.",
             "confidence_pct": 70
         }
     }

@@ -19,7 +19,6 @@ app.add_middleware(
 TD_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 TD_BASE = "https://api.twelvedata.com"
 
-# Twelve Data interval examples: "1min","5min","15min","30min","1h","4h","1day","1week","1month"
 ALLOWED_INTERVALS = {
     "1min","5min","15min","30min",
     "1h","2h","4h","8h","12h",
@@ -27,15 +26,17 @@ ALLOWED_INTERVALS = {
 }
 
 class BacktestRequest(BaseModel):
-    market: str              # "crypto" | "forex" | "stocks" | "indices"
-    symbol: str              # ex: "BTC/USD" (crypto) or "EUR/USD" (forex) or "AAPL" (stocks) or "SPX" (indices) depending on provider
-    interval: str            # ex: "1h", "4h", "1day"
-    outputsize: int = 500    # number of candles (keep <= provider limits)
-    exchange: str | None = None  # optional, e.g. "NASDAQ" for stocks, or crypto exchange if needed
+    market: str              # crypto | forex | stocks | indices
+    symbol: str
+    interval: str
+    outputsize: int = 500
+    exchange: str | None = None
+
 
 @app.get("/health")
 def health():
     return {"status": "ok", "provider": "twelvedata", "has_api_key": bool(TD_API_KEY)}
+
 
 @app.get("/backtests/mock")
 def backtests_mock():
@@ -66,28 +67,17 @@ def backtests_mock():
         "ai_insights": {"summary": "Mock data.", "confidence_pct": 60}
     }
 
-def td_time_series(market: str, symbol: str, interval: str, outputsize: int, exchange: str | None):
-    if not TD_API_KEY:
-        raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY in Railway variables")
 
-    if interval not in ALLOWED_INTERVALS:
-        raise HTTPException(status_code=400, detail=f"Invalid interval. Allowed: {sorted(ALLOWED_INTERVALS)}")
-
-    # Twelve Data uses different endpoints per asset class
-    # - Stocks/indices/forex/crypto can be served via /time_series with appropriate symbol formatting
-    # Often:
-    #  crypto: "BTC/USD" (and optionally exchange like "Coinbase")
-    #  forex: "EUR/USD"
-    #  stocks: "AAPL" + exchange "NASDAQ"
-    #  indices: varies by provider. Common: "SPX", "DJI", etc (may require exchange)
+def _td_request_time_series(symbol: str, interval: str, outputsize: int, exchange: str | None):
     url = f"{TD_BASE}/time_series"
     params = {
         "apikey": TD_API_KEY,
         "symbol": symbol,
         "interval": interval,
-        "outputsize": int(max(50, min(outputsize, 5000))),  # clamp
+        "outputsize": int(max(50, min(outputsize, 5000))),
         "format": "JSON",
-        "timezone": "UTC"
+        "timezone": "UTC",
+        "order": "ASC",
     }
     if exchange:
         params["exchange"] = exchange
@@ -97,27 +87,43 @@ def td_time_series(market: str, symbol: str, interval: str, outputsize: int, exc
         raise HTTPException(status_code=502, detail=f"TwelveData HTTP {r.status_code}: {r.text}")
 
     data = r.json()
-
-    # Twelve Data errors typically look like: {"status":"error","message":"...","code":...}
     if isinstance(data, dict) and data.get("status") == "error":
         raise HTTPException(status_code=400, detail=f"TwelveData error: {data.get('message')}")
+    return data
+
+
+def td_time_series(symbol: str, interval: str, outputsize: int, exchange: str | None):
+    if not TD_API_KEY:
+        raise HTTPException(status_code=500, detail="Missing TWELVEDATA_API_KEY in Railway variables")
+    if interval not in ALLOWED_INTERVALS:
+        raise HTTPException(status_code=400, detail=f"Invalid interval. Allowed: {sorted(ALLOWED_INTERVALS)}")
+
+    # 1) Try with exchange (if provided)
+    try:
+        data = _td_request_time_series(symbol, interval, outputsize, exchange)
+    except HTTPException as e:
+        # 2) If exchange was provided, retry once WITHOUT exchange (fixes many ETF/index cases)
+        if exchange:
+            try:
+                data = _td_request_time_series(symbol, interval, outputsize, None)
+            except HTTPException:
+                raise e
+        else:
+            raise e
 
     values = data.get("values")
     if not values or not isinstance(values, list):
         raise HTTPException(status_code=400, detail=f"No OHLCV returned for {symbol} {interval}")
 
-    # values are newest-first; make ascending time
     df = pd.DataFrame(values)
-    # Normalize columns
-    # expected: datetime, open, high, low, close, volume (volume may be missing for some assets)
+
     if "datetime" not in df.columns or "close" not in df.columns:
         raise HTTPException(status_code=400, detail="Provider response missing datetime/close")
 
     df["time"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(None)
-    for col in ["open","high","low","close"]:
+    for col in ["open", "high", "low", "close"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
     if "volume" in df.columns:
         df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
 
@@ -128,6 +134,7 @@ def td_time_series(market: str, symbol: str, interval: str, outputsize: int, exc
 
     return df
 
+
 @app.post("/backtests/run")
 def run_backtest(req: BacktestRequest):
     market = (req.market or "").lower().strip()
@@ -135,14 +142,14 @@ def run_backtest(req: BacktestRequest):
     interval = (req.interval or "").strip()
     exchange = (req.exchange or "").strip() if req.exchange else None
 
-    if market not in {"crypto","forex","stocks","indices"}:
+    if market not in {"crypto", "forex", "stocks", "indices"}:
         raise HTTPException(status_code=400, detail="market must be one of: crypto, forex, stocks, indices")
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
 
-    df = td_time_series(market, symbol, interval, req.outputsize, exchange)
+    df = td_time_series(symbol, interval, req.outputsize, exchange)
 
-    # --- Strategy v1: EMA 20/50 crossover on close ---
+    # Strategy v1: EMA 20/50 crossover
     ema_fast, ema_slow = 20, 50
     df["ema_fast"] = df["close"].ewm(span=ema_fast, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=ema_slow, adjust=False).mean()
@@ -184,7 +191,7 @@ def run_backtest(req: BacktestRequest):
         "equity_curve": equity_curve,
         "drawdown_curve": drawdown_curve,
         "ai_insights": {
-            "summary": "Baseline EMA crossover. Next: RSI/ATR + multi-timeframe confirmation + realistic fees/slippage.",
+            "summary": "Baseline EMA crossover. Next: RSI/ATR + multi-timeframe confirmation + fees/slippage.",
             "confidence_pct": 70
         }
     }

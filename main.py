@@ -36,18 +36,59 @@ class BacktestRequest(BaseModel):
     outputsize: int = 500
     exchange: str | None = None
 
-    # Strategy JSON:
+    # Strategy JSON blocks
     entry: StrategyBlock
     filter: StrategyBlock | None = None
     exit: StrategyBlock | None = None
 
     # realism
-    fee_bps: float = 2.0       # 2 bps = 0.02%
-    slippage_bps: float = 1.0  # 1 bp = 0.01%
+    fee_bps: float = 2.0
+    slippage_bps: float = 1.0
+
 
 @app.get("/health")
 def health():
     return {"status": "ok", "provider": "twelvedata", "has_api_key": bool(TD_API_KEY)}
+
+
+@app.get("/backtests/mock")
+def backtests_mock():
+    return {
+        "strategy_name": "Mock Strategy (fallback)",
+        "symbol": "BTC/USD",
+        "execution_timeframe": "1h",
+        "capital": {"initial_sek": 10000, "final_sek": 11250},
+        "kpi": {
+            "total_return_pct": 12.5,
+            "max_drawdown_pct": -4.2,
+            "sharpe": 1.1,
+            "win_rate_pct": 52,
+            "trade_count": 38
+        },
+        "equity_curve": [
+            {"time": "2026-01-01T00:00:00", "equity_sek": 10000},
+            {"time": "2026-01-02T00:00:00", "equity_sek": 10120},
+            {"time": "2026-01-03T00:00:00", "equity_sek": 10080},
+            {"time": "2026-01-04T00:00:00", "equity_sek": 10340},
+            {"time": "2026-01-05T00:00:00", "equity_sek": 10650},
+            {"time": "2026-01-06T00:00:00", "equity_sek": 10580},
+            {"time": "2026-01-07T00:00:00", "equity_sek": 11250}
+        ],
+        "drawdown_curve": [
+            {"time": "2026-01-01T00:00:00", "dd_pct": 0},
+            {"time": "2026-01-02T00:00:00", "dd_pct": 0},
+            {"time": "2026-01-03T00:00:00", "dd_pct": -0.4},
+            {"time": "2026-01-04T00:00:00", "dd_pct": 0},
+            {"time": "2026-01-05T00:00:00", "dd_pct": 0},
+            {"time": "2026-01-06T00:00:00", "dd_pct": -0.7},
+            {"time": "2026-01-07T00:00:00", "dd_pct": 0}
+        ],
+        "ai_insights": {
+            "summary": "Fallback mock while no recent backtest is stored in session.",
+            "confidence_pct": 50
+        }
+    }
+
 
 def _td_request(symbol: str, interval: str, outputsize: int, exchange: str | None):
     url = f"{TD_BASE}/time_series"
@@ -71,6 +112,7 @@ def _td_request(symbol: str, interval: str, outputsize: int, exchange: str | Non
     if isinstance(data, dict) and data.get("status") == "error":
         raise HTTPException(status_code=400, detail=f"TwelveData error: {data.get('message')}")
     return data
+
 
 def td_time_series(symbol: str, interval: str, outputsize: int, exchange: str | None):
     if not TD_API_KEY:
@@ -96,7 +138,7 @@ def td_time_series(symbol: str, interval: str, outputsize: int, exchange: str | 
         raise HTTPException(status_code=400, detail="Provider response missing datetime/close")
 
     df["time"] = pd.to_datetime(df["datetime"], utc=True).dt.tz_convert(None)
-    for col in ["open","high","low","close"]:
+    for col in ["open", "high", "low", "close"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     if "volume" in df.columns:
@@ -107,7 +149,13 @@ def td_time_series(symbol: str, interval: str, outputsize: int, exchange: str | 
     if df.empty or len(df) < 50:
         raise HTTPException(status_code=400, detail="Not enough data to backtest (try higher outputsize)")
 
+    # Ensure OHLC exists (some series might not provide open/high/low)
+    for col in ["open", "high", "low"]:
+        if col not in df.columns:
+            df[col] = df["close"]
+
     return df
+
 
 def apply_entry(df: pd.DataFrame, block: StrategyBlock) -> pd.Series:
     t = block.type
@@ -137,8 +185,8 @@ def apply_entry(df: pd.DataFrame, block: StrategyBlock) -> pd.Series:
 
     raise HTTPException(status_code=400, detail=f"Unknown entry type: {t}")
 
+
 def resample_to_interval(df: pd.DataFrame, target: str) -> pd.DataFrame:
-    # Map TwelveData interval to pandas freq
     freq_map = {
         "1h": "1H",
         "2h": "2H",
@@ -165,8 +213,8 @@ def resample_to_interval(df: pd.DataFrame, target: str) -> pd.DataFrame:
     out = out.dropna(subset=["close"]).reset_index()
     return out
 
+
 def apply_filter_ltf(df_ltf: pd.DataFrame, block: StrategyBlock) -> pd.Series:
-    # Only HTF trend filter v1: close_above_ema on higher timeframe
     t = block.type
     p = block.params or {}
 
@@ -180,7 +228,6 @@ def apply_filter_ltf(df_ltf: pd.DataFrame, block: StrategyBlock) -> pd.Series:
     df_htf["ema"] = df_htf["close"].ewm(span=ema_len, adjust=False).mean()
     df_htf["ok"] = (df_htf["close"] > df_htf["ema"]).astype(int)
 
-    # Map HTF to LTF via merge_asof (last known HTF value)
     ltf = df_ltf[["time"]].copy().sort_values("time")
     htf = df_htf[["time", "ok"]].copy().sort_values("time")
 
@@ -188,17 +235,15 @@ def apply_filter_ltf(df_ltf: pd.DataFrame, block: StrategyBlock) -> pd.Series:
     ok = merged["ok"].fillna(0).astype(int)
     return ok
 
+
 def backtest_long_only(df: pd.DataFrame, signal: pd.Series, fee_bps: float, slippage_bps: float):
-    # Apply costs each time position changes (enter/exit)
     df = df.copy()
     df["signal"] = signal.fillna(0).astype(int)
-
     df["returns"] = df["close"].pct_change().fillna(0.0)
 
     pos = df["signal"].shift(1).fillna(0).astype(int)
     strat_ret = df["returns"] * pos
 
-    # costs: when pos changes (trade)
     trade_event = (df["signal"].diff().fillna(0) != 0).astype(int)
     cost_pct = (fee_bps + slippage_bps) / 10000.0
     strat_ret = strat_ret - (trade_event * cost_pct)
@@ -210,6 +255,7 @@ def backtest_long_only(df: pd.DataFrame, signal: pd.Series, fee_bps: float, slip
     dd = df["equity"] / running_max - 1.0
 
     return df, dd, int(trade_event.sum())
+
 
 @app.post("/backtests/run")
 def run_backtest(req: BacktestRequest):
@@ -259,7 +305,7 @@ def run_backtest(req: BacktestRequest):
         "equity_curve": equity_curve,
         "drawdown_curve": drawdown_curve,
         "ai_insights": {
-            "summary": "Now supports Strategy JSON (entry/filter) + fees/slippage. Next: exits (ATR/TP) + trade list.",
+            "summary": "Strategy JSON (entry/filter) + fees/slippage enabled. Next: exits (ATR/TP) + trade list + save runs.",
             "confidence_pct": 75
         }
     }

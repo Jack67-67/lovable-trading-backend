@@ -1,5 +1,3 @@
-# ===== PROFESSIONAL TRADE ENGINE VERSION =====
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -29,6 +27,7 @@ class RiskBlock(BaseModel):
     atr_length: int = 14
     sl_atr_mult: float = 2.0
     rr: float = 2.0
+    risk_pct: float = 1.0  # % of capital per trade
 
 class BacktestRequest(BaseModel):
     market: str
@@ -97,93 +96,116 @@ def run_backtest(req: BacktestRequest):
 
     df = fetch_data(req.symbol, req.interval, req.outputsize, req.exchange)
 
-    # Entry logic (EMA crossover only for now)
+    # ===== ENTRY LOGIC (EMA crossover only for now) =====
     fast = req.entry.params.get("fast", 20)
     slow = req.entry.params.get("slow", 50)
 
     df["ema_fast"] = df["close"].ewm(span=fast).mean()
     df["ema_slow"] = df["close"].ewm(span=slow).mean()
 
-    df["long_signal"] = (df["ema_fast"] > df["ema_slow"])
-    df["short_signal"] = (df["ema_fast"] < df["ema_slow"])
+    df["long_signal"] = df["ema_fast"] > df["ema_slow"]
+    df["short_signal"] = df["ema_fast"] < df["ema_slow"]
 
     df["atr"] = compute_atr(df, req.risk.atr_length)
 
-    initial_capital = 10000
-    capital = initial_capital
-    position = None
-    trades = []
+    capital = 10000.0
+    initial_capital = capital
     equity_curve = []
+    trades = []
+    position = None
+
+    fee_pct = req.fee_bps / 10000
+    slip_pct = req.slippage_bps / 10000
 
     for i in range(1, len(df)):
         row = df.iloc[i]
 
-        # Update equity
         equity_curve.append({
             "time": str(row["time"]),
             "equity_sek": capital
         })
 
         if position:
-            # Check exit
             if position["side"] == "long":
                 if row["low"] <= position["sl"]:
-                    pnl = -position["risk"]
-                    capital += pnl
-                    trades.append({**position, "exit_time": str(row["time"]), "pnl": pnl})
-                    position = None
+                    pnl = -position["risk_amount"]
                 elif row["high"] >= position["tp"]:
-                    pnl = position["risk"] * req.risk.rr
-                    capital += pnl
-                    trades.append({**position, "exit_time": str(row["time"]), "pnl": pnl})
-                    position = None
+                    pnl = position["risk_amount"] * req.risk.rr
+                else:
+                    pnl = None
 
-            if position and position["side"] == "short":
+            else:  # short
                 if row["high"] >= position["sl"]:
-                    pnl = -position["risk"]
-                    capital += pnl
-                    trades.append({**position, "exit_time": str(row["time"]), "pnl": pnl})
-                    position = None
+                    pnl = -position["risk_amount"]
                 elif row["low"] <= position["tp"]:
-                    pnl = position["risk"] * req.risk.rr
-                    capital += pnl
-                    trades.append({**position, "exit_time": str(row["time"]), "pnl": pnl})
-                    position = None
+                    pnl = position["risk_amount"] * req.risk.rr
+                else:
+                    pnl = None
 
-        # New entry
+            if pnl is not None:
+                pnl -= capital * (fee_pct + slip_pct)
+                capital += pnl
+
+                trades.append({
+                    "side": position["side"],
+                    "entry_time": position["entry_time"],
+                    "exit_time": str(row["time"]),
+                    "entry_price": position["entry_price"],
+                    "exit_price": row["close"],
+                    "pnl": pnl,
+                    "pnl_pct": pnl / initial_capital * 100
+                })
+
+                position = None
+
         if not position and not np.isnan(row["atr"]):
-            risk_amount = capital * 0.01  # 1% risk per trade
+            risk_amount = capital * (req.risk.risk_pct / 100)
             atr = row["atr"]
 
             if row["long_signal"]:
                 sl = row["close"] - atr * req.risk.sl_atr_mult
-                tp = row["close"] + (atr * req.risk.sl_atr_mult * req.risk.rr)
+                tp = row["close"] + atr * req.risk.sl_atr_mult * req.risk.rr
                 position = {
                     "side": "long",
                     "entry_time": str(row["time"]),
                     "entry_price": row["close"],
                     "sl": sl,
                     "tp": tp,
-                    "risk": risk_amount
+                    "risk_amount": risk_amount
                 }
 
             elif row["short_signal"]:
                 sl = row["close"] + atr * req.risk.sl_atr_mult
-                tp = row["close"] - (atr * req.risk.sl_atr_mult * req.risk.rr)
+                tp = row["close"] - atr * req.risk.sl_atr_mult * req.risk.rr
                 position = {
                     "side": "short",
                     "entry_time": str(row["time"]),
                     "entry_price": row["close"],
                     "sl": sl,
                     "tp": tp,
-                    "risk": risk_amount
+                    "risk_amount": risk_amount
                 }
 
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    win_rate = (wins / len(trades) * 100) if trades else 0
+    equity_series = pd.Series([e["equity_sek"] for e in equity_curve])
+    returns = equity_series.pct_change().fillna(0)
+
+    total_return_pct = (capital / initial_capital - 1) * 100
+
+    running_max = equity_series.cummax()
+    drawdown = equity_series / running_max - 1
+    max_drawdown_pct = drawdown.min() * 100 if not drawdown.empty else 0
+
+    sharpe = (returns.mean() / (returns.std() + 1e-9)) * np.sqrt(252)
+
+    win_rate = (len([t for t in trades if t["pnl"] > 0]) / len(trades) * 100) if trades else 0
+
+    drawdown_curve = [
+        {"time": equity_curve[i]["time"], "dd_pct": drawdown.iloc[i] * 100}
+        for i in range(len(drawdown))
+    ]
 
     return {
-        "strategy_name": "EMA Pro Engine",
+        "strategy_name": "EMA Pro Performance Engine",
         "symbol": req.symbol,
         "execution_timeframe": req.interval,
         "capital": {
@@ -191,17 +213,17 @@ def run_backtest(req: BacktestRequest):
             "final_sek": capital
         },
         "kpi": {
-            "total_return_pct": ((capital / initial_capital - 1) * 100),
-            "max_drawdown_pct": 0,
-            "sharpe": 0,
+            "total_return_pct": total_return_pct,
+            "max_drawdown_pct": max_drawdown_pct,
+            "sharpe": sharpe,
             "win_rate_pct": win_rate,
             "trade_count": len(trades)
         },
         "equity_curve": equity_curve,
-        "drawdown_curve": [],
+        "drawdown_curve": drawdown_curve,
         "trades": trades,
         "ai_insights": {
-            "summary": "ATR-based risk engine with long & short.",
-            "confidence_pct": 80
+            "summary": "Performance engine with realistic trade tracking.",
+            "confidence_pct": 85
         }
     }

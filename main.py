@@ -215,7 +215,37 @@ def resample_to_interval(df: pd.DataFrame, target: str) -> pd.DataFrame:
 
 
 def apply_filter_ltf(df_ltf: pd.DataFrame, block: StrategyBlock) -> pd.Series:
-    t = block.type
+    try:
+        t = block.type
+        p = block.params or {}
+
+        if t != "htf_close_above_ema":
+            return pd.Series(1, index=df_ltf.index)
+
+        htf_interval = str(p.get("interval", "4h"))
+        ema_len = int(p.get("ema", 200))
+
+        df_htf = resample_to_interval(df_ltf, htf_interval)
+
+        if df_htf.empty or len(df_htf) < 10:
+            # Not enough HTF data → disable filter instead of crashing
+            return pd.Series(1, index=df_ltf.index)
+
+        df_htf["ema"] = df_htf["close"].ewm(span=ema_len, adjust=False).mean()
+        df_htf["ok"] = (df_htf["close"] > df_htf["ema"]).astype(int)
+
+        ltf = df_ltf[["time"]].copy().sort_values("time")
+        htf = df_htf[["time", "ok"]].copy().sort_values("time")
+
+        merged = pd.merge_asof(ltf, htf, on="time", direction="backward")
+
+        ok = merged["ok"].fillna(1).astype(int)
+        return ok
+
+    except Exception:
+        # If anything fails, just don't filter instead of crashing
+        return pd.Series(1, index=df_ltf.index)
+        t = block.type
     p = block.params or {}
 
     if t != "htf_close_above_ema":
